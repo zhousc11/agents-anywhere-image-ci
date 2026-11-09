@@ -1,0 +1,133 @@
+# Drop this file into a repo you own as .github/workflows/server-image.yml.
+# It builds the upstream Server image for linux/amd64 on every upstream release
+# and pushes it to GHCR, so `ten` only has to pull the delta instead of receiving
+# a ~500 MB image over the home uplink.
+#
+# First push creates a *private* package. Either make it public
+# (repo -> Packages -> package -> Settings -> Change visibility) or give the
+# cluster an imagePullSecret with a PAT that has read:packages.
+name: server-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag, e.g. v2.1.0 (empty = latest release)"
+        required: false
+  schedule:
+    - cron: "0 19 * * *" # 03:00 Asia/Shanghai
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: server-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve upstream tag
+        id: tag
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="$(curl -fsSL https://api.github.com/repos/anywhere-labs/Agents-Anywhere/releases/latest | jq -r .tag_name)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: anywhere-labs/Agents-Anywhere
+          ref: ${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if this tag was already built
+        id: exists
+        run: |
+          image="ghcr.io/${{ github.repository_owner }}/agents-anywhere-server:${{ steps.tag.outputs.tag }}"
+          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only notify when the release is a real candidate for this instance:
+      # it must contain the deployed commit and not predate the migrated schema.
+      # Repo variables DEPLOYED_COMMIT / DEPLOYED_SCHEMA are updated at deploy time.
+      - name: Is this release newer than the deployment?
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          DEPLOYED_COMMIT: ${{ vars.DEPLOYED_COMMIT }}
+          DEPLOYED_SCHEMA: ${{ vars.DEPLOYED_SCHEMA }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOYED_COMMIT" ] || [ -z "$DEPLOYED_SCHEMA" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          schema="$(curl -fsSL "https://raw.githubusercontent.com/anywhere-labs/Agents-Anywhere/$TAG/server/agent_server/infra/db/migrations.py" \
+            | sed -n 's/^CURRENT_SCHEMA_REVISION = "\(.*\)"/\1/p' | head -1)"
+          num() { echo "${1#v2_}" | tr -cd '0-9'; }
+          if [ -z "$schema" ] || [ "$(num "$schema")" -lt "$(num "$DEPLOYED_SCHEMA")" ]; then
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          status="$(gh api "repos/anywhere-labs/Agents-Anywhere/compare/$DEPLOYED_COMMIT...$TAG" --jq .status)"
+          case "$status" in
+            ahead|identical) echo "relevant=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "relevant=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: docker/build-push-action@v6
+        if: steps.exists.outputs.exists == 'false'
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: server
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/agents-anywhere-server:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/agents-anywhere-server:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### server image"
+            echo "- tag: \`${{ steps.tag.outputs.tag }}\`"
+            echo "- image: \`ghcr.io/${{ github.repository_owner }}/agents-anywhere-server:${{ steps.tag.outputs.tag }}\`"
+            echo "- already existed: \`${{ steps.exists.outputs.exists }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Bark (new image)
+        if: steps.exists.outputs.exists == 'false' && steps.rel.outputs.relevant == 'true'
+        env:
+          BARK_URL: ${{ secrets.BARK_URL }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          curl -fsS -X POST "$BARK_URL" -H 'Content-Type: application/json' \
+            -d "{\"title\":\"AA ${TAG} 镜像就绪\",\"body\":\"GHCR 已推送，可执行 upgrade.sh\",\"group\":\"Agents Anywhere\",\"level\":\"timeSensitive\"}" || true
+
+      - name: Notify Bark (failure)
+        if: failure()
+        env:
+          BARK_URL: ${{ secrets.BARK_URL }}
+        run: |
+          curl -fsS -X POST "$BARK_URL" -H 'Content-Type: application/json' \
+            -d "{\"title\":\"AA 构建失败\",\"body\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",\"group\":\"Agents Anywhere\",\"level\":\"active\"}" || true
